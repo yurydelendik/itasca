@@ -1,7 +1,7 @@
 //! Generic slot interpreter and synchronous call boundary.
+use super::abstract_store::{AbstractStore, Callee, StorePlatform, StoreValue};
 use super::bytecode::Instr;
 use super::platform::Alloc;
-use super::store::FuncCode;
 use super::*;
 
 mod bulk;
@@ -10,26 +10,33 @@ pub(crate) mod int;
 mod memory;
 pub(crate) mod simd;
 
-struct Frame {
-    instance: usize,
+struct Frame<I> {
+    instance: I,
     function: usize,
     pc: u32,
     base: usize,
 }
-/// Reusable invocation storage. No frame or memory borrow survives a host call.
-pub struct Execution {
+/// Reusable invocation storage over instance handles `I` and boundary values
+/// `V`. No frame or memory borrow survives a host call.
+pub struct ExecutionOf<I, V> {
     store: usize,
     slots: Vec<u64>,
-    frames: Vec<Frame>,
-    host_args: Vec<Value>,
-    host_results: Vec<Value>,
+    frames: Vec<Frame<I>>,
+    host_args: Vec<V>,
+    host_results: Vec<V>,
 }
-impl Default for Execution {
+/// Reusable invocation storage for a `Store`.
+pub type Execution = ExecutionOf<usize, Value>;
+/// Reusable invocation storage for an abstract store `S`.
+pub type StoreExecution<S> = ExecutionOf<<S as AbstractStore>::Instance, StoreValue<S>>;
+type Exec<S> = StoreExecution<S>;
+
+impl<I, V> Default for ExecutionOf<I, V> {
     fn default() -> Self {
         Self::new()
     }
 }
-impl Execution {
+impl<I, V> ExecutionOf<I, V> {
     /// Creates empty execution storage, reusable across synchronous invocations.
     pub fn new() -> Self {
         Self {
@@ -38,24 +45,6 @@ impl Execution {
             frames: Vec::new(),
             host_args: Vec::new(),
             host_results: Vec::new(),
-        }
-    }
-    /// Returns the complete-module byte offset of the current instruction.
-    pub fn source_offset<M: MemoryBuffer>(
-        &self,
-        store: &Store<M>,
-    ) -> Result<Option<usize>, ExecError> {
-        if self.frames.len() == 0 {
-            return Ok(None);
-        }
-        store.check(self.store)?;
-        let f = &self.frames[self.frames.len() - 1];
-        let code = &store.instances[f.instance].module.functions[f.function];
-        let pc = if f.pc == 0 { 0 } else { f.pc - 1 };
-        if (pc as usize) < code.source_offsets.len() {
-            Ok(Some(code.source_offsets[pc as usize]))
-        } else {
-            Ok(None)
         }
     }
     fn ensure<A: Alloc>(&mut self, end: usize, limit: usize) -> Result<(), ExecError> {
@@ -72,15 +61,49 @@ impl Execution {
         Ok(())
     }
 }
-fn interrupt<M: MemoryBuffer, P: Platform<M>>(platform: &mut P) -> Result<(), ExecError> {
+impl<I: Copy, V> ExecutionOf<I, V> {
+    /// Returns the complete-module byte offset of the current instruction.
+    pub fn source_offset<S: AbstractStore<Instance = I>>(
+        &self,
+        store: &S,
+    ) -> Result<Option<usize>, ExecError> {
+        if self.frames.len() == 0 {
+            return Ok(None);
+        }
+        if store.identity() != self.store {
+            return Err(ExecError::WrongStore);
+        }
+        let f = &self.frames[self.frames.len() - 1];
+        let code = &store.module(f.instance).functions[f.function];
+        let pc = if f.pc == 0 { 0 } else { f.pc - 1 };
+        if (pc as usize) < code.source_offsets.len() {
+            Ok(Some(code.source_offsets[pc as usize]))
+        } else {
+            Ok(None)
+        }
+    }
+}
+fn interrupt<S: AbstractStore, P: StorePlatform<S>>(platform: &mut P) -> Result<(), ExecError> {
     match platform.interrupt() {
         InterruptAction::Continue => Ok(()),
         InterruptAction::Terminate => Err(ExecError::Terminated),
     }
 }
-fn check_values<M: MemoryBuffer>(
-    store: &Store<M>,
-    values: &[Value],
+fn check_value<S: AbstractStore>(store: &S, v: StoreValue<S>) -> Result<(), ExecError> {
+    let owned = match v {
+        Val::FuncRef(Some(f)) => store.owns_func(f),
+        Val::ExternRef(Some(e)) => store.owns_extern(e),
+        _ => true,
+    };
+    if owned {
+        Ok(())
+    } else {
+        Err(ExecError::WrongStore)
+    }
+}
+fn check_values<S: AbstractStore>(
+    store: &S,
+    values: &[StoreValue<S>],
     types: &[ValueType],
 ) -> Result<(), ExecError> {
     if values.len() != types.len() {
@@ -89,7 +112,7 @@ fn check_values<M: MemoryBuffer>(
     let mut i = 0;
     let mut status = Ok(());
     while i < values.len() && status.is_ok() {
-        status = store.check_value(values[i]);
+        status = check_value(store, values[i]);
         if status.is_ok() && values[i].value_type() != types[i] {
             status = Err(ExecError::BadArguments);
         }
@@ -103,86 +126,120 @@ fn check_failed(result: Result<(), ExecError>) -> bool {
         Err(_) => true,
     }
 }
-fn encode_slot(slots: &mut [u64], position: usize, ty: ValueType, value: Value) {
-    let (lo, hi) = value::encode(value);
+fn encode_slot<S: AbstractStore>(
+    store: &S,
+    slots: &mut [u64],
+    position: usize,
+    ty: ValueType,
+    value: StoreValue<S>,
+) {
+    let (lo, hi) = match value {
+        Val::I32(v) | Val::F32(v) => (v as u64, 0),
+        Val::I64(v) | Val::F64(v) => (v, 0),
+        Val::V128(v) => (v as u64, (v >> 64) as u64),
+        Val::FuncRef(None) | Val::ExternRef(None) => (0, 0),
+        Val::FuncRef(Some(f)) => (store.func_to_ref(f), 0),
+        Val::ExternRef(Some(e)) => (store.extern_to_ref(e), 0),
+    };
     slots[position] = lo;
     if value::width(ty) == 2 {
         slots[position + 1] = hi;
     }
 }
-fn decode_slot(slots: &[u64], position: usize, ty: ValueType, store: usize) -> Value {
-    let hi = if value::width(ty) == 2 {
-        slots[position + 1]
-    } else {
-        0
-    };
-    value::decode(ty, slots[position], hi, store)
+fn decode_slot<S: AbstractStore>(
+    store: &S,
+    slots: &[u64],
+    position: usize,
+    ty: ValueType,
+) -> StoreValue<S> {
+    let lo = slots[position];
+    match ty {
+        ValueType::I32 => Val::I32(lo as u32),
+        ValueType::I64 => Val::I64(lo),
+        ValueType::F32 => Val::F32(lo as u32),
+        ValueType::F64 => Val::F64(lo),
+        ValueType::V128 => Val::V128(lo as u128 | ((slots[position + 1] as u128) << 64)),
+        ValueType::FuncRef => Val::FuncRef(if lo == 0 {
+            None
+        } else {
+            Some(store.func_from_ref(lo))
+        }),
+        ValueType::ExternRef => Val::ExternRef(if lo == 0 {
+            None
+        } else {
+            Some(store.extern_from_ref(lo))
+        }),
+    }
 }
 fn type_slots(types: &[ValueType]) -> Result<usize, ExecError> {
     value::type_slots(types).ok_or(ExecError::Exhausted(ResourceLimit::Values))
 }
-pub(crate) fn invoke_with<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
+pub(crate) fn invoke_with<S: AbstractStore, P: StorePlatform<S>, F: FloatOps, A: Alloc>(
+    exec: &mut Exec<S>,
+    store: &mut S,
     platform: &mut P,
-    func: FuncAddr,
-    args: &[Value],
-    results: &mut Vec<Value>,
+    func: S::Func,
+    args: &[StoreValue<S>],
+    results: &mut Vec<StoreValue<S>>,
 ) -> Result<(), ExecError> {
-    let ty = store.func_type(func)?;
+    if !store.owns_func(func) {
+        return Err(ExecError::WrongStore);
+    }
+    let ty = store.signature(func);
     check_values(store, args, &ty.params)?;
     let needed = type_slots(&ty.params)?.max(type_slots(&ty.results)?);
-    exec.ensure::<A>(needed, store.limits.max_values)?;
+    exec.ensure::<A>(needed, store.max_values())?;
     clear(&mut exec.frames);
-    exec.store = store.id;
+    exec.store = store.identity();
     let mut i = 0;
     let mut slot = 0;
     while i < args.len() {
-        encode_slot(&mut exec.slots, slot, ty.params[i], args[i]);
+        encode_slot(store, &mut exec.slots, slot, ty.params[i], args[i]);
         slot += value::width(ty.params[i]) as usize;
         i += 1;
     }
-    call::<M, P, F, A>(exec, store, platform, func, 0)?;
+    call::<S, P, F, A>(exec, store, platform, func, 0)?;
     let mut status = Ok(());
     while exec.frames.len() > 0 && status.is_ok() {
-        status = step::<M, P, F, A>(exec, store, platform);
+        status = step::<S, P, F, A>(exec, store, platform);
     }
     status?;
-    let ty = store.func_type(func)?;
+    let ty = store.signature(func);
     reserve::<A, _>(results, ty.results.len().saturating_sub(results.len()))?;
     clear(results);
     i = 0;
     slot = 0;
     while i < ty.results.len() {
         let t = ty.results[i];
-        let value = decode_slot(&exec.slots, slot, t, store.id);
+        let value = decode_slot(store, &exec.slots, slot, t);
         results.push(value);
         slot += value::width(t) as usize;
         i += 1;
     }
     Ok(())
 }
-fn call<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
+fn call<S: AbstractStore, P: StorePlatform<S>, F: FloatOps, A: Alloc>(
+    exec: &mut Exec<S>,
+    store: &mut S,
     platform: &mut P,
-    func: FuncAddr,
+    func: S::Func,
     base: usize,
 ) -> Result<(), ExecError> {
-    interrupt::<M, P>(platform)?;
-    match store.funcs[func.index].code {
-        FuncCode::Wasm { instance, function } => {
-            if exec.frames.len() >= store.limits.max_frames {
+    interrupt::<S, P>(platform)?;
+    match store.callee(func) {
+        Callee::Wasm { instance, function } => {
+            if exec.frames.len() >= store.max_frames() {
                 return Err(ExecError::Exhausted(ResourceLimit::CallStack));
             }
-            let code = &store.instances[instance].module.functions[function];
+            let code = &store.module(instance).functions[function];
             let end = match base.checked_add(code.slot_count as usize) {
                 Some(n) => n,
                 None => return Err(ExecError::Exhausted(ResourceLimit::Values)),
             };
-            exec.ensure::<A>(end, store.limits.max_values)?;
-            let mut i = base + code.param_slots as usize;
-            while i < base + code.local_slots as usize {
+            let (param_slots, local_slots) = (code.param_slots as usize, code.local_slots as usize);
+            exec.ensure::<A>(end, store.max_values())?;
+            let mut i = base + param_slots;
+            while i < base + local_slots {
                 exec.slots[i] = 0;
                 i += 1;
             }
@@ -194,14 +251,14 @@ fn call<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
                 base,
             });
         }
-        FuncCode::Host(id) => {
-            let ty = &store.types[store.funcs[func.index].signature];
+        Callee::Host(id) => {
+            let ty = store.signature(func);
             let size = type_slots(&ty.results)?.max(type_slots(&ty.params)?);
             let end = match base.checked_add(size) {
                 Some(n) => n,
                 None => return Err(ExecError::Exhausted(ResourceLimit::Values)),
             };
-            exec.ensure::<A>(end, store.limits.max_values)?;
+            exec.ensure::<A>(end, store.max_values())?;
             let args_add = ty.params.len().saturating_sub(exec.host_args.len());
             reserve::<A, _>(&mut exec.host_args, args_add)?;
             let results_add = ty.results.len().saturating_sub(exec.host_results.len());
@@ -212,14 +269,14 @@ fn call<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
             let mut pos = base;
             while i < ty.params.len() {
                 let t = ty.params[i];
-                let value = decode_slot(&exec.slots, pos, t, store.id);
+                let value = decode_slot(store, &exec.slots, pos, t);
                 exec.host_args.push(value);
                 pos += value::width(t) as usize;
                 i += 1;
             }
             i = 0;
             while i < ty.results.len() {
-                exec.host_results.push(Value::zero(ty.results[i]));
+                exec.host_results.push(Val::zero(ty.results[i]));
                 i += 1;
             }
             match platform.call_host(store, id, &exec.host_args, &mut exec.host_results) {
@@ -229,7 +286,7 @@ fn call<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
                     return Err(ExecError::Exhausted(ResourceLimit::CallStack))
                 }
             }
-            let ty = &store.types[store.funcs[func.index].signature];
+            let ty = store.signature(func);
             // A callback cannot turn a malformed result into API argument rejection.
             if check_failed(check_values(store, &exec.host_results, &ty.results)) {
                 return Err(ExecError::Trap(Trap::Host));
@@ -238,7 +295,7 @@ fn call<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
             pos = base;
             while i < ty.results.len() {
                 let value = exec.host_results[i];
-                encode_slot(&mut exec.slots, pos, ty.results[i], value);
+                encode_slot(store, &mut exec.slots, pos, ty.results[i], value);
                 pos += value::width(ty.results[i]) as usize;
                 i += 1;
             }
@@ -264,9 +321,9 @@ fn vector(slots: &[u64], pos: usize) -> u128 {
     get(slots, pos) as u128 | ((get(slots, pos + 1) as u128) << 64)
 }
 #[inline(always)]
-fn step<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
+fn step<S: AbstractStore, P: StorePlatform<S>, F: FloatOps, A: Alloc>(
+    exec: &mut Exec<S>,
+    store: &mut S,
     platform: &mut P,
 ) -> Result<(), ExecError> {
     let frame_index = exec.frames.len() - 1;
@@ -275,12 +332,12 @@ fn step<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
     let function = frame.function;
     let base = frame.base;
     let pc = frame.pc;
-    let instruction = store.instances[inst].module.functions[function].code[pc as usize];
+    let instruction = store.module(inst).functions[function].code[pc as usize];
     exec.frames[frame_index].pc = match pc.checked_add(1) {
         Some(next) => next,
         None => return Err(ExecError::Internal),
     };
-    dispatch::<M, P, F, A>(
+    dispatch::<S, P, F, A>(
         exec,
         store,
         platform,
@@ -293,8 +350,8 @@ fn step<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
 }
 
 #[inline(always)]
-fn execute_scalar<F: FloatOps>(
-    exec: &mut Execution,
+fn execute_scalar<I, V, F: FloatOps>(
+    exec: &mut ExecutionOf<I, V>,
     base: usize,
     op: u16,
     dst: u32,
@@ -310,51 +367,51 @@ fn execute_scalar<F: FloatOps>(
     Ok(())
 }
 #[inline(always)]
-fn execute_load<M: MemoryBuffer>(
-    exec: &mut Execution,
-    store: &Store<M>,
-    inst: usize,
+fn execute_load<S: AbstractStore>(
+    exec: &mut Exec<S>,
+    store: &S,
+    inst: S::Instance,
     base: usize,
     op: u16,
     dst: u32,
     addr: u32,
     offset: u32,
 ) -> Result<(), ExecError> {
-    let m = store.instances[inst].memories[0].index;
+    let m = store.instance_memory(inst, 0);
     let result = memory::load(
         op,
         exec.slots[base + addr as usize] as u32,
         offset,
-        store.memories[m].buf.bytes(),
+        store.memory_bytes(m),
     )?;
     exec.slots[base + dst as usize] = result;
     Ok(())
 }
 #[inline(always)]
-fn execute_store<M: MemoryBuffer>(
-    exec: &Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_store<S: AbstractStore>(
+    exec: &Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     base: usize,
     op: u16,
     addr: u32,
     value: u32,
     offset: u32,
 ) -> Result<(), ExecError> {
-    let m = store.instances[inst].memories[0].index;
+    let m = store.instance_memory(inst, 0);
     memory::store(
         op,
         exec.slots[base + addr as usize] as u32,
         offset,
         exec.slots[base + value as usize],
-        store.memories[m].buf.bytes_mut(),
+        store.memory_bytes_mut(m),
     )
 }
 #[inline(always)]
-fn execute_simd<M: MemoryBuffer, F: FloatOps>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_simd<S: AbstractStore, F: FloatOps>(
+    exec: &mut Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     function: usize,
     base: usize,
     op: u32,
@@ -362,7 +419,7 @@ fn execute_simd<M: MemoryBuffer, F: FloatOps>(
     a: u32,
     entry: u32,
 ) -> Result<(), ExecError> {
-    let imm = store.instances[inst].module.functions[function].simd[entry as usize];
+    let imm = store.module(inst).functions[function].simd[entry as usize];
     let shape = match super::bytecode::simd_shape(op) {
         Some(s) => s,
         None => return Err(ExecError::Internal),
@@ -385,8 +442,8 @@ fn execute_simd<M: MemoryBuffer, F: FloatOps>(
     } else {
         get(&exec.slots, z_pos) as u128
     };
-    let result = if store.instances[inst].memories.len() > 0 {
-        let m = store.instances[inst].memories[0].index;
+    let result = if store.instance_has_memory(inst) {
+        let m = store.instance_memory(inst, 0);
         simd::simd::<F>(
             op,
             imm.offset,
@@ -395,7 +452,7 @@ fn execute_simd<M: MemoryBuffer, F: FloatOps>(
             x,
             y,
             z,
-            Some(store.memories[m].buf.bytes_mut()),
+            Some(store.memory_bytes_mut(m)),
         )?
     } else {
         simd::simd::<F>(op, imm.offset, imm.lane, imm.bits, x, y, z, None)?
@@ -410,20 +467,30 @@ fn execute_simd<M: MemoryBuffer, F: FloatOps>(
 }
 
 #[inline(always)]
-fn execute_copy(exec: &mut Execution, base: usize, dst: u32, src: u32) -> Result<(), ExecError> {
+fn execute_copy<I, V>(
+    exec: &mut ExecutionOf<I, V>,
+    base: usize,
+    dst: u32,
+    src: u32,
+) -> Result<(), ExecError> {
     exec.slots[base + dst as usize] = exec.slots[base + src as usize];
     Ok(())
 }
 
 #[inline(always)]
-fn execute_copy2(exec: &mut Execution, base: usize, dst: u32, src: u32) -> Result<(), ExecError> {
+fn execute_copy2<I, V>(
+    exec: &mut ExecutionOf<I, V>,
+    base: usize,
+    dst: u32,
+    src: u32,
+) -> Result<(), ExecError> {
     copy(&mut exec.slots, base + dst as usize, base + src as usize, 2);
     Ok(())
 }
 
 #[inline(always)]
-fn execute_copy_n(
-    exec: &mut Execution,
+fn execute_copy_n<I, V>(
+    exec: &mut ExecutionOf<I, V>,
     base: usize,
     dst: u32,
     src: u32,
@@ -439,8 +506,8 @@ fn execute_copy_n(
 }
 
 #[inline(always)]
-fn execute_const32(
-    exec: &mut Execution,
+fn execute_const32<I, V>(
+    exec: &mut ExecutionOf<I, V>,
     base: usize,
     dst: u32,
     value: u32,
@@ -450,8 +517,8 @@ fn execute_const32(
 }
 
 #[inline(always)]
-fn execute_const64(
-    exec: &mut Execution,
+fn execute_const64<I, V>(
+    exec: &mut ExecutionOf<I, V>,
     base: usize,
     dst: u32,
     value: u64,
@@ -461,30 +528,34 @@ fn execute_const64(
 }
 
 #[inline(always)]
-fn execute_const_v128<M: MemoryBuffer>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_const_v128<S: AbstractStore>(
+    exec: &mut Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     function: usize,
     base: usize,
     dst: u32,
     pool: u32,
 ) -> Result<(), ExecError> {
-    let v = store.instances[inst].module.functions[function].v128_pool[pool as usize];
+    let v = store.module(inst).functions[function].v128_pool[pool as usize];
     exec.slots[base + dst as usize] = v as u64;
     exec.slots[base + dst as usize + 1] = (v >> 64) as u64;
     Ok(())
 }
 
 #[inline(always)]
-fn execute_jump(exec: &mut Execution, frame_index: usize, target: u32) -> Result<(), ExecError> {
+fn execute_jump<I, V>(
+    exec: &mut ExecutionOf<I, V>,
+    frame_index: usize,
+    target: u32,
+) -> Result<(), ExecError> {
     exec.frames[frame_index].pc = target;
     Ok(())
 }
 
 #[inline(always)]
-fn execute_jump_if_zero(
-    exec: &mut Execution,
+fn execute_jump_if_zero<I, V>(
+    exec: &mut ExecutionOf<I, V>,
     frame_index: usize,
     base: usize,
     cond: u32,
@@ -497,8 +568,8 @@ fn execute_jump_if_zero(
 }
 
 #[inline(always)]
-fn execute_jump_if_non_zero(
-    exec: &mut Execution,
+fn execute_jump_if_non_zero<I, V>(
+    exec: &mut ExecutionOf<I, V>,
     frame_index: usize,
     base: usize,
     cond: u32,
@@ -511,11 +582,11 @@ fn execute_jump_if_non_zero(
 }
 
 #[inline(always)]
-fn execute_jump_table<M: MemoryBuffer>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
+fn execute_jump_table<S: AbstractStore>(
+    exec: &mut Exec<S>,
+    store: &mut S,
     frame_index: usize,
-    inst: usize,
+    inst: S::Instance,
     function: usize,
     base: usize,
     index: u32,
@@ -524,71 +595,68 @@ fn execute_jump_table<M: MemoryBuffer>(
 ) -> Result<(), ExecError> {
     let index = exec.slots[base + index as usize] as u32;
     let selected = if index < len - 1 { index } else { len - 1 };
-    let target =
-        store.instances[inst].module.functions[function].jump_tables[(start + selected) as usize];
+    let target = store.module(inst).functions[function].jump_tables[(start + selected) as usize];
     exec.frames[frame_index].pc = target;
     Ok(())
 }
 
 #[inline(always)]
-fn execute_loop_head<M: MemoryBuffer, P: Platform<M>>(platform: &mut P) -> Result<(), ExecError> {
-    interrupt::<M, P>(platform)
+fn execute_loop_head<S: AbstractStore, P: StorePlatform<S>>(
+    platform: &mut P,
+) -> Result<(), ExecError> {
+    interrupt::<S, P>(platform)
 }
 
 #[inline(always)]
-fn execute_call<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
+fn execute_call<S: AbstractStore, P: StorePlatform<S>, F: FloatOps, A: Alloc>(
+    exec: &mut Exec<S>,
+    store: &mut S,
     platform: &mut P,
-    inst: usize,
+    inst: S::Instance,
     base: usize,
     func: u32,
     callee: u32,
 ) -> Result<(), ExecError> {
-    let addr = store.instances[inst].funcs[func as usize];
-    call::<M, P, F, A>(exec, store, platform, addr, base + callee as usize)
+    let addr = store.instance_func(inst, func);
+    call::<S, P, F, A>(exec, store, platform, addr, base + callee as usize)
 }
 
 #[inline(always)]
-fn execute_call_indirect<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
+fn execute_call_indirect<S: AbstractStore, P: StorePlatform<S>, F: FloatOps, A: Alloc>(
+    exec: &mut Exec<S>,
+    store: &mut S,
     platform: &mut P,
-    inst: usize,
+    inst: S::Instance,
     function: usize,
     base: usize,
     entry: u32,
     index: u32,
     callee: u32,
 ) -> Result<(), ExecError> {
-    let (table, ty) = store.instances[inst].module.functions[function].indirect[entry as usize];
-    let t = store.instances[inst].tables[table as usize].index;
-    let i = exec.slots[base + index as usize] as u32 as usize;
-    if i >= store.tables[t].elements.len() {
+    let (table, ty) = store.module(inst).functions[function].indirect[entry as usize];
+    let t = store.instance_table(inst, table);
+    let i = exec.slots[base + index as usize] as u32;
+    if i >= store.table_len(t) {
         return Err(Trap::TableOutOfBounds.into());
     }
-    let reference = store.tables[t].elements[i];
+    let reference = store.table_ref(t, i);
     if reference == 0 {
         return Err(Trap::UninitializedElement.into());
     }
-    let f = reference as usize - 1;
-    if store.funcs[f].signature != store.instances[inst].types[ty as usize] {
+    let f = store.func_from_ref(reference);
+    if store.func_type_id(f) != store.instance_type_id(inst, ty) {
         return Err(Trap::IndirectCallTypeMismatch.into());
     }
-    call::<M, P, F, A>(
-        exec,
-        store,
-        platform,
-        FuncAddr {
-            store: store.id,
-            index: f,
-        },
-        base + callee as usize,
-    )
+    call::<S, P, F, A>(exec, store, platform, f, base + callee as usize)
 }
 
 #[inline(always)]
-fn execute_return(exec: &mut Execution, base: usize, src: u32, n: u32) -> Result<(), ExecError> {
+fn execute_return<I, V>(
+    exec: &mut ExecutionOf<I, V>,
+    base: usize,
+    src: u32,
+    n: u32,
+) -> Result<(), ExecError> {
     copy(&mut exec.slots, base, base + src as usize, n as usize);
     exec.frames.pop();
     Ok(())
@@ -600,8 +668,8 @@ fn execute_unreachable() -> Result<(), ExecError> {
 }
 
 #[inline(always)]
-fn execute_select(
-    exec: &mut Execution,
+fn execute_select<I, V>(
+    exec: &mut ExecutionOf<I, V>,
     base: usize,
     a: u32,
     b: u32,
@@ -614,8 +682,8 @@ fn execute_select(
 }
 
 #[inline(always)]
-fn execute_select2(
-    exec: &mut Execution,
+fn execute_select2<I, V>(
+    exec: &mut ExecutionOf<I, V>,
     base: usize,
     a: u32,
     b: u32,
@@ -628,99 +696,103 @@ fn execute_select2(
 }
 
 #[inline(always)]
-fn execute_global_get<M: MemoryBuffer>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_global_get<S: AbstractStore>(
+    exec: &mut Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     base: usize,
     dst: u32,
     global: u32,
 ) -> Result<(), ExecError> {
-    let g = &store.globals[store.instances[inst].globals[global as usize].index];
-    exec.slots[base + dst as usize] = g.lo;
+    let g = store.instance_global(inst, global);
+    exec.slots[base + dst as usize] = store.global_get(g);
     Ok(())
 }
 
 #[inline(always)]
-fn execute_global_get2<M: MemoryBuffer>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_global_get2<S: AbstractStore>(
+    exec: &mut Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     base: usize,
     dst: u32,
     global: u32,
 ) -> Result<(), ExecError> {
-    let g = &store.globals[store.instances[inst].globals[global as usize].index];
-    exec.slots[base + dst as usize] = g.lo;
-    exec.slots[base + dst as usize + 1] = g.hi;
+    let v = store.global_get_v128(store.instance_global(inst, global));
+    exec.slots[base + dst as usize] = v as u64;
+    exec.slots[base + dst as usize + 1] = (v >> 64) as u64;
     Ok(())
 }
 
 #[inline(always)]
-fn execute_global_set<M: MemoryBuffer>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_global_set<S: AbstractStore>(
+    exec: &mut Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     base: usize,
     src: u32,
     global: u32,
 ) -> Result<(), ExecError> {
-    let g = &mut store.globals[store.instances[inst].globals[global as usize].index];
-    g.lo = exec.slots[base + src as usize];
+    let g = store.instance_global(inst, global);
+    store.global_set(g, exec.slots[base + src as usize]);
     Ok(())
 }
 
 #[inline(always)]
-fn execute_global_set2<M: MemoryBuffer>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_global_set2<S: AbstractStore>(
+    exec: &mut Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     base: usize,
     src: u32,
     global: u32,
 ) -> Result<(), ExecError> {
-    let g = &mut store.globals[store.instances[inst].globals[global as usize].index];
-    g.lo = exec.slots[base + src as usize];
-    g.hi = exec.slots[base + src as usize + 1];
+    let g = store.instance_global(inst, global);
+    let v = vector(&exec.slots, base + src as usize);
+    store.global_set_v128(g, v);
     Ok(())
 }
 
 #[inline(always)]
-fn execute_memory_size<M: MemoryBuffer>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_memory_size<S: AbstractStore>(
+    exec: &mut Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     base: usize,
     dst: u32,
 ) -> Result<(), ExecError> {
-    let m = store.instances[inst].memories[0].index;
-    exec.slots[base + dst as usize] = (store.memories[m].buf.bytes().len() / 65536) as u64;
+    let m = store.instance_memory(inst, 0);
+    exec.slots[base + dst as usize] = (store.memory_bytes(m).len() / 65536) as u64;
     Ok(())
 }
 
 #[inline(always)]
-fn execute_memory_grow<M: MemoryBuffer>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_memory_grow<S: AbstractStore>(
+    exec: &mut Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     base: usize,
     dst: u32,
 ) -> Result<(), ExecError> {
-    let m = store.instances[inst].memories[0].index;
+    let m = store.instance_memory(inst, 0);
     exec.slots[base + dst as usize] =
-        store.grow_memory_index(m, exec.slots[base + dst as usize] as u32) as u64;
+        store.memory_grow(m, exec.slots[base + dst as usize] as u32) as u64;
     Ok(())
 }
 
 #[inline(always)]
-fn execute_ref_null(exec: &mut Execution, base: usize, dst: u32) -> Result<(), ExecError> {
+fn execute_ref_null<I, V>(
+    exec: &mut ExecutionOf<I, V>,
+    base: usize,
+    dst: u32,
+) -> Result<(), ExecError> {
     exec.slots[base + dst as usize] = 0;
     Ok(())
 }
 
 #[inline(always)]
-fn execute_ref_is_null(
-    exec: &mut Execution,
+fn execute_ref_is_null<I, V>(
+    exec: &mut ExecutionOf<I, V>,
     base: usize,
     dst: u32,
     a: u32,
@@ -734,95 +806,92 @@ fn execute_ref_is_null(
 }
 
 #[inline(always)]
-fn execute_ref_func<M: MemoryBuffer>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_ref_func<S: AbstractStore>(
+    exec: &mut Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     base: usize,
     dst: u32,
     func: u32,
 ) -> Result<(), ExecError> {
-    exec.slots[base + dst as usize] =
-        match (store.instances[inst].funcs[func as usize].index as u64).checked_add(1) {
-            Some(reference) => reference,
-            None => return Err(ExecError::Internal),
-        };
+    let f = store.instance_func(inst, func);
+    exec.slots[base + dst as usize] = store.func_to_ref(f);
     Ok(())
 }
 
 #[inline(always)]
-fn execute_table_get<M: MemoryBuffer>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_table_get<S: AbstractStore>(
+    exec: &mut Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     base: usize,
     dst: u32,
     index: u32,
     table: u32,
 ) -> Result<(), ExecError> {
-    let t = store.instances[inst].tables[table as usize].index;
-    let i = exec.slots[base + index as usize] as u32 as usize;
-    if i >= store.tables[t].elements.len() {
+    let t = store.instance_table(inst, table);
+    let i = exec.slots[base + index as usize] as u32;
+    if i >= store.table_len(t) {
         return Err(Trap::TableOutOfBounds.into());
     }
-    exec.slots[base + dst as usize] = store.tables[t].elements[i];
+    exec.slots[base + dst as usize] = store.table_ref(t, i);
     Ok(())
 }
 
 #[inline(always)]
-fn execute_table_set<M: MemoryBuffer>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_table_set<S: AbstractStore>(
+    exec: &mut Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     base: usize,
     index: u32,
     value: u32,
     table: u32,
 ) -> Result<(), ExecError> {
-    let t = store.instances[inst].tables[table as usize].index;
-    let i = exec.slots[base + index as usize] as u32 as usize;
-    if i >= store.tables[t].elements.len() {
+    let t = store.instance_table(inst, table);
+    let i = exec.slots[base + index as usize] as u32;
+    if i >= store.table_len(t) {
         return Err(Trap::TableOutOfBounds.into());
     }
-    store.tables[t].elements[i] = exec.slots[base + value as usize];
+    store.set_table_ref(t, i, exec.slots[base + value as usize]);
     Ok(())
 }
 
 #[inline(always)]
-fn execute_table_size<M: MemoryBuffer>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_table_size<S: AbstractStore>(
+    exec: &mut Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     base: usize,
     dst: u32,
     table: u32,
 ) -> Result<(), ExecError> {
-    let t = store.instances[inst].tables[table as usize].index;
-    exec.slots[base + dst as usize] = store.tables[t].elements.len() as u64;
+    let t = store.instance_table(inst, table);
+    exec.slots[base + dst as usize] = store.table_len(t) as u64;
     Ok(())
 }
 
 #[inline(always)]
-fn execute_table_grow<M: MemoryBuffer, A: Alloc>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_table_grow<S: AbstractStore, A: Alloc>(
+    exec: &mut Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     base: usize,
     dst: u32,
     table: u32,
 ) -> Result<(), ExecError> {
-    let t = store.instances[inst].tables[table as usize].index;
+    let t = store.instance_table(inst, table);
     let v = exec.slots[base + dst as usize];
     let delta = exec.slots[base + dst as usize + 1] as u32;
-    exec.slots[base + dst as usize] = store.grow_table_index::<A>(t, delta, v) as u64;
+    exec.slots[base + dst as usize] = store.table_grow(t, delta, v) as u64;
     Ok(())
 }
 
 #[inline(always)]
-fn execute_bulk<M: MemoryBuffer>(
-    exec: &mut Execution,
-    store: &mut Store<M>,
-    inst: usize,
+fn execute_bulk<S: AbstractStore>(
+    exec: &mut Exec<S>,
+    store: &mut S,
+    inst: S::Instance,
     function: usize,
     base: usize,
     instruction: Instr,
@@ -864,20 +933,20 @@ macro_rules! define_dispatch {
             }
         }
         #[inline(always)]
-        fn dispatch_scalar<F: FloatOps>(
-            exec: &mut Execution,
+        fn dispatch_scalar<I, V, F: FloatOps>(
+            exec: &mut ExecutionOf<I, V>,
             base: usize,
             op: u16,
             instruction: Instr,
         ) -> Result<(), ExecError> {
             let (dst, a, b) = scalar_operands(instruction);
-            execute_scalar::<F>(exec, base, op, dst, a, b)
+            execute_scalar::<_, _, F>(exec, base, op, dst, a, b)
         }
         #[inline(always)]
-        fn dispatch_load<M: MemoryBuffer>(
-            exec: &mut Execution,
-            store: &Store<M>,
-            inst: usize,
+        fn dispatch_load<S: AbstractStore>(
+            exec: &mut Exec<S>,
+            store: &S,
+            inst: S::Instance,
             base: usize,
             op: u16,
             instruction: Instr,
@@ -886,10 +955,10 @@ macro_rules! define_dispatch {
             execute_load(exec, store, inst, base, op, dst, addr, offset)
         }
         #[inline(always)]
-        fn dispatch_store<M: MemoryBuffer>(
-            exec: &Execution,
-            store: &mut Store<M>,
-            inst: usize,
+        fn dispatch_store<S: AbstractStore>(
+            exec: &Exec<S>,
+            store: &mut S,
+            inst: S::Instance,
             base: usize,
             op: u16,
             instruction: Instr,
@@ -898,35 +967,35 @@ macro_rules! define_dispatch {
             execute_store(exec, store, inst, base, op, addr, value, offset)
         }
         #[inline(always)]
-        fn dispatch_simd<M: MemoryBuffer, F: FloatOps>(
-            exec: &mut Execution,
-            store: &mut Store<M>,
-            inst: usize,
+        fn dispatch_simd<S: AbstractStore, F: FloatOps>(
+            exec: &mut Exec<S>,
+            store: &mut S,
+            inst: S::Instance,
             function: usize,
             base: usize,
             op: u32,
             instruction: Instr,
         ) -> Result<(), ExecError> {
             let (dst, a, entry) = simd_operands(instruction);
-            execute_simd::<M, F>(exec, store, inst, function, base, op, dst, a, entry)
+            execute_simd::<S, F>(exec, store, inst, function, base, op, dst, a, entry)
         }
         #[inline(always)]
-        fn dispatch<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
-            exec: &mut Execution,
-            store: &mut Store<M>,
+        fn dispatch<S: AbstractStore, P: StorePlatform<S>, F: FloatOps, A: Alloc>(
+            exec: &mut Exec<S>,
+            store: &mut S,
             platform: &mut P,
             frame_index: usize,
-            inst: usize,
+            inst: S::Instance,
             function: usize,
             base: usize,
             instruction: Instr,
         ) -> Result<(), ExecError> {
             match instruction {
-                $(Instr::$scalar { .. } => dispatch_scalar::<F>(exec, base, $scalar_op, instruction),)*
+                $(Instr::$scalar { .. } => dispatch_scalar::<_, _, F>(exec, base, $scalar_op, instruction),)*
                 $(Instr::$load { .. } => dispatch_load(exec, store, inst, base, $load_op, instruction),)*
                 $(Instr::$store { .. } => dispatch_store(exec, store, inst, base, $store_op, instruction),)*
                 $(Instr::$simd { .. } => {
-                    dispatch_simd::<M, F>(exec, store, inst, function, base, $simd_op, instruction)
+                    dispatch_simd::<S, F>(exec, store, inst, function, base, $simd_op, instruction)
                 })*
                 Instr::Copy { dst, src } => execute_copy(exec, base, dst, src),
                 Instr::Copy2 { dst, src } => execute_copy2(exec, base, dst, src),
@@ -954,15 +1023,15 @@ macro_rules! define_dispatch {
                     start,
                     len,
                 ),
-                Instr::LoopHead => execute_loop_head::<M, P>(platform),
+                Instr::LoopHead => execute_loop_head::<S, P>(platform),
                 Instr::Call { func, base: callee } => {
-                    execute_call::<M, P, F, A>(exec, store, platform, inst, base, func, callee)
+                    execute_call::<S, P, F, A>(exec, store, platform, inst, base, func, callee)
                 }
                 Instr::CallIndirect {
                     entry,
                     index,
                     base: callee,
-                } => execute_call_indirect::<M, P, F, A>(
+                } => execute_call_indirect::<S, P, F, A>(
                     exec, store, platform, inst, function, base, entry, index, callee,
                 ),
                 Instr::Return { src, n } => execute_return(exec, base, src, n),
@@ -998,7 +1067,7 @@ macro_rules! define_dispatch {
                     execute_table_size(exec, store, inst, base, dst, table)
                 }
                 Instr::TableGrow { dst, table } => {
-                    execute_table_grow::<M, A>(exec, store, inst, base, dst, table)
+                    execute_table_grow::<S, A>(exec, store, inst, base, dst, table)
                 }
                 Instr::MemoryFill { .. }
                 | Instr::MemoryCopy { .. }
@@ -1016,16 +1085,16 @@ super::operators::with_ops!(define_dispatch);
 
 /// Runs compiler-generated initialization code through the ordinary step loop
 /// and returns the first two result slots.
-fn run_synthetic<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
-    store: &mut Store<M>,
+fn run_synthetic<S: AbstractStore, P: StorePlatform<S>, F: FloatOps, A: Alloc>(
+    store: &mut S,
     platform: &mut P,
-    instance: usize,
+    instance: S::Instance,
     function: usize,
 ) -> Result<(u64, u64), ExecError> {
-    let count = store.instances[instance].module.functions[function].slot_count as usize;
-    let mut exec = Execution::new();
-    exec.store = store.id;
-    exec.ensure::<A>(count, store.limits.max_values)?;
+    let count = store.module(instance).functions[function].slot_count as usize;
+    let mut exec = Exec::<S>::new();
+    exec.store = store.identity();
+    exec.ensure::<A>(count, store.max_values())?;
     reserve::<A, _>(&mut exec.frames, 1)?;
     exec.frames.push(Frame {
         instance,
@@ -1035,31 +1104,31 @@ fn run_synthetic<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
     });
     let mut status = Ok(());
     while exec.frames.len() > 0 && status.is_ok() {
-        status = step::<M, P, F, A>(&mut exec, store, platform);
+        status = step::<S, P, F, A>(&mut exec, store, platform);
     }
     status?;
     Ok((get(&exec.slots, 0), get(&exec.slots, 1)))
 }
 
 /// Evaluates a compiled constant expression of type `ty`.
-pub(crate) fn eval_const<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
-    store: &mut Store<M>,
+pub(crate) fn eval_const<S: AbstractStore, P: StorePlatform<S>, F: FloatOps, A: Alloc>(
+    store: &mut S,
     platform: &mut P,
-    instance: usize,
+    instance: S::Instance,
     function: usize,
     ty: ValueType,
-) -> Result<Value, ExecError> {
-    let (lo, hi) = run_synthetic::<M, P, F, A>(store, platform, instance, function)?;
-    Ok(value::decode(ty, lo, hi, store.id))
+) -> Result<StoreValue<S>, ExecError> {
+    let (lo, hi) = run_synthetic::<S, P, F, A>(store, platform, instance, function)?;
+    Ok(decode_slot(store, &[lo, hi], 0, ty))
 }
 
 /// Runs the instance's compiled active-segment writes and segment drops.
-pub(crate) fn initialize_segments<M: MemoryBuffer, P: Platform<M>, F: FloatOps, A: Alloc>(
-    store: &mut Store<M>,
+pub(crate) fn initialize_segments<S: AbstractStore, P: StorePlatform<S>, F: FloatOps, A: Alloc>(
+    store: &mut S,
     platform: &mut P,
-    instance: usize,
+    instance: S::Instance,
 ) -> Result<(), ExecError> {
-    let function = store.instances[instance].module.initialization;
-    run_synthetic::<M, P, F, A>(store, platform, instance, function)?;
+    let function = store.module(instance).initialization;
+    run_synthetic::<S, P, F, A>(store, platform, instance, function)?;
     Ok(())
 }

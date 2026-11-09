@@ -10,6 +10,7 @@
 use crate::{FuncType, ValueType};
 use alloc::vec::Vec;
 
+mod abstract_store;
 mod bytecode;
 mod compiler;
 mod interp;
@@ -20,10 +21,11 @@ mod platform;
 mod value;
 
 mod store;
+pub use abstract_store::{AbstractStore, Callee, StorePlatform, StoreValue};
 pub use compiler::{
     CompileError, CompileLimits, CompileResource, ControlMap, ExecutableModule, FunctionStats,
 };
-pub use interp::Execution;
+pub use interp::{Execution, ExecutionOf, StoreExecution};
 #[cfg(not(charon))]
 pub use native::{compile, compile_with_limits};
 pub use platform::{FloatOps, HostError, InterruptAction, MemoryBuffer, Platform, VecMemory};
@@ -57,19 +59,22 @@ pub struct Instantiated {
     pub start: Option<FuncAddr>,
 }
 
-/// A typed Wasm value. Integer and floating-point payloads preserve raw bits.
+/// A typed Wasm value whose references are store handles. Integer and
+/// floating-point payloads preserve raw bits.
 #[derive(Clone, Copy)]
 #[cfg_attr(not(charon), derive(Debug, PartialEq, Eq))]
-pub enum Value {
+pub enum Val<F, E> {
     I32(u32),
     I64(u64),
     F32(u32),
     F64(u64),
     V128(u128),
-    FuncRef(Option<FuncAddr>),
-    ExternRef(Option<ExternAddr>),
+    FuncRef(Option<F>),
+    ExternRef(Option<E>),
 }
-impl Value {
+/// A typed Wasm value of a `Store`.
+pub type Value = Val<FuncAddr, ExternAddr>;
+impl<F, E> Val<F, E> {
     /// Returns this value's WebAssembly type.
     pub fn value_type(self) -> ValueType {
         match self {

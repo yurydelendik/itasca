@@ -206,7 +206,7 @@ impl<M: MemoryBuffer> Store<M> {
         committed: &mut bool,
     ) -> Result<Instantiated, ExecError> {
         *committed = true;
-        initialize_segments::<M, P, F, A>(self, platform, identity.index)?;
+        initialize_segments::<Self, P, F, A>(self, platform, identity.index)?;
         let start = match self.instances[identity.index].module.env().start() {
             Some(f) => Some(self.instances[identity.index].funcs[f as usize]),
             None => None,
@@ -332,7 +332,8 @@ impl<M: MemoryBuffer> Store<M> {
     ) -> Result<(), ExecError> {
         let g = self.instances[instance].module.env().globals()[i];
         let initializer = self.instances[instance].module.global_initializers[i];
-        let v = eval_const::<M, P, F, A>(self, platform, instance, initializer, g.gtype.valtype)?;
+        let v =
+            eval_const::<Self, P, F, A>(self, platform, instance, initializer, g.gtype.valtype)?;
         let addr = self.define_global_with::<A>(g.gtype, v)?;
         self.instances[instance].globals.push(addr);
         Ok(())
@@ -355,7 +356,7 @@ impl<M: MemoryBuffer> Store<M> {
             let ty = self.instances[instance].module.env().elements()[i]
                 .elem
                 .value_type();
-            match eval_const::<M, P, F, A>(self, platform, instance, initializer, ty) {
+            match eval_const::<Self, P, F, A>(self, platform, instance, initializer, ty) {
                 Ok(v) => values.push(value::encode(v).0),
                 Err(e) => status = Err(e),
             }
@@ -394,7 +395,7 @@ impl<M: MemoryBuffer> Store<M> {
                 None => return Err(ExecError::Internal),
             };
             let start =
-                eval_const::<M, P, F, A>(self, platform, instance, initializer, ValueType::I32)?
+                eval_const::<Self, P, F, A>(self, platform, instance, initializer, ValueType::I32)?
                     .i32()?;
             let len = self.instances[instance].module.env().elements()[index]
                 .init
@@ -423,7 +424,7 @@ impl<M: MemoryBuffer> Store<M> {
                 None => return Err(ExecError::Internal),
             };
             let start =
-                eval_const::<M, P, F, A>(self, platform, instance, initializer, ValueType::I32)?
+                eval_const::<Self, P, F, A>(self, platform, instance, initializer, ValueType::I32)?
                     .i32()?;
             let len = self.instances[instance].module.tail().data[index]
                 .init
