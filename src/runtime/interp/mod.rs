@@ -101,6 +101,7 @@ fn check_value<S: AbstractStore>(store: &S, v: StoreValue<S>) -> Result<(), Exec
         Err(ExecError::WrongStore)
     }
 }
+#[inline(never)]
 fn check_values<S: AbstractStore>(
     store: &S,
     values: &[StoreValue<S>],
@@ -126,6 +127,7 @@ fn check_failed(result: Result<(), ExecError>) -> bool {
         Err(_) => true,
     }
 }
+#[inline(never)]
 fn encode_slot<S: AbstractStore>(
     store: &S,
     slots: &mut [u64],
@@ -146,6 +148,7 @@ fn encode_slot<S: AbstractStore>(
         slots[position + 1] = hi;
     }
 }
+#[inline(never)]
 fn decode_slot<S: AbstractStore>(
     store: &S,
     slots: &[u64],
